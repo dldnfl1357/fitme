@@ -10,6 +10,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import BodyModel3D from './BodyModel3D';
 
 type Measurements = {
   height: string;
@@ -293,9 +294,16 @@ export default function App() {
         </View>
 
         <View style={styles.hero}>
+          <View style={styles.avatarStage}>
+            <BodyModel3D
+              measurements={effectiveMeasurements}
+              garmentColor={selected.color}
+              garmentCategory={selected.category}
+            />
+          </View>
           <View style={styles.heroCopy}>
-            <Text style={styles.heroLabel}>Body profile</Text>
-            <Text style={styles.heroTitle}>상세 치수로 브랜드별 실제 핏을 예측합니다.</Text>
+            <Text style={styles.heroLabel}>3D body profile</Text>
+            <Text style={styles.heroTitle}>입력한 치수로 실제 체형 모델을 렌더링합니다.</Text>
             <View style={styles.metaRow}>
               <View style={styles.metaItem}>
                 <Text style={styles.metaValue}>{bodyType}</Text>
@@ -305,21 +313,6 @@ export default function App() {
                 <Text style={styles.metaValue}>{preference}</Text>
                 <Text style={styles.metaLabel}>선호 핏</Text>
               </View>
-            </View>
-          </View>
-          <View style={styles.avatarStage}>
-            <View
-              style={[styles.shoulderLine, { width: Math.max(78, toNumber(effectiveMeasurements.shoulder) * 2.35) }]}
-            />
-            <View style={[styles.torso, { width: Math.max(74, toNumber(effectiveMeasurements.chest) * 0.88) }]}>
-              <View
-                style={[styles.waistLine, { width: Math.max(52, toNumber(effectiveMeasurements.waist) * 0.82) }]}
-              />
-            </View>
-            <View style={[styles.hipLine, { width: Math.max(76, toNumber(effectiveMeasurements.hip) * 0.83) }]} />
-            <View style={styles.legs}>
-              <View style={styles.leg} />
-              <View style={styles.leg} />
             </View>
           </View>
         </View>
@@ -539,18 +532,16 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   hero: {
-    backgroundColor: '#FFFFFF',
-    borderColor: '#E7E9DF',
+    backgroundColor: '#E9F8F6',
     borderRadius: 8,
-    borderWidth: 1,
-    flexDirection: 'row',
-    minHeight: 218,
+    minHeight: 602,
     overflow: 'hidden',
   },
   heroCopy: {
-    flex: 1,
     justifyContent: 'space-between',
-    padding: 18,
+    paddingBottom: 18,
+    paddingHorizontal: 18,
+    paddingTop: 10,
   },
   heroLabel: {
     color: '#F45D48',
@@ -562,10 +553,10 @@ const styles = StyleSheet.create({
   },
   heroTitle: {
     color: '#111827',
-    fontSize: 23,
+    fontSize: 22,
     fontWeight: '900',
     letterSpacing: 0,
-    lineHeight: 31,
+    lineHeight: 29,
   },
   metaRow: {
     flexDirection: 'row',
@@ -594,8 +585,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: '#E9F8F6',
     justifyContent: 'center',
-    paddingHorizontal: 14,
-    width: 138,
+    minHeight: 420,
+    width: '100%',
   },
   shoulderLine: {
     backgroundColor: '#111827',
