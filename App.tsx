@@ -22,6 +22,8 @@ type Measurements = {
   arm: string;
 };
 
+type MeasurementKey = keyof Measurements;
+
 type Garment = {
   id: string;
   brand: string;
@@ -44,12 +46,12 @@ type Garment = {
 const initialMeasurements: Measurements = {
   height: '168',
   weight: '58',
-  shoulder: '39',
-  chest: '86',
-  waist: '70',
-  hip: '94',
-  inseam: '74',
-  arm: '57',
+  shoulder: '',
+  chest: '',
+  waist: '',
+  hip: '',
+  inseam: '',
+  arm: '',
 };
 
 const garments: Garment[] = [
@@ -102,27 +104,125 @@ const garments: Garment[] = [
   },
 ];
 
-const fields: { key: keyof Measurements; label: string; unit: string }[] = [
-  { key: 'height', label: '키', unit: 'cm' },
-  { key: 'weight', label: '몸무게', unit: 'kg' },
-  { key: 'shoulder', label: '어깨', unit: 'cm' },
-  { key: 'chest', label: '가슴', unit: 'cm' },
-  { key: 'waist', label: '허리', unit: 'cm' },
-  { key: 'hip', label: '엉덩이', unit: 'cm' },
-  { key: 'inseam', label: '인심', unit: 'cm' },
-  { key: 'arm', label: '팔길이', unit: 'cm' },
+const fields: {
+  key: MeasurementKey;
+  label: string;
+  unit: string;
+  required?: boolean;
+  guide: string;
+}[] = [
+  {
+    key: 'height',
+    label: '키',
+    unit: 'cm',
+    required: true,
+    guide: '신발을 벗고 벽에 등을 붙인 상태에서 정수리부터 바닥까지 잽니다.',
+  },
+  {
+    key: 'weight',
+    label: '몸무게',
+    unit: 'kg',
+    required: true,
+    guide: '가벼운 옷차림으로 체중계에 올라 현재 몸무게를 입력합니다.',
+  },
+  {
+    key: 'shoulder',
+    label: '어깨',
+    unit: 'cm',
+    guide: '왼쪽 어깨 끝 뼈부터 오른쪽 어깨 끝 뼈까지 등을 따라 수평으로 잽니다.',
+  },
+  {
+    key: 'chest',
+    label: '가슴',
+    unit: 'cm',
+    guide: '겨드랑이 아래를 지나 가슴의 가장 넓은 부분을 한 바퀴 둘러 잽니다.',
+  },
+  {
+    key: 'waist',
+    label: '허리',
+    unit: 'cm',
+    guide: '허리에서 가장 잘록한 지점을 숨을 편하게 쉰 상태로 한 바퀴 잽니다.',
+  },
+  {
+    key: 'hip',
+    label: '엉덩이',
+    unit: 'cm',
+    guide: '엉덩이에서 가장 넓게 튀어나온 지점을 수평으로 한 바퀴 잽니다.',
+  },
+  {
+    key: 'inseam',
+    label: '인심',
+    unit: 'cm',
+    guide: '다리 안쪽 시작점부터 발목 복숭아뼈 아래까지 안쪽 라인을 따라 잽니다.',
+  },
+  {
+    key: 'arm',
+    label: '팔길이',
+    unit: 'cm',
+    guide: '어깨 끝에서 팔꿈치를 지나 손목뼈까지 팔 바깥 라인을 따라 잽니다.',
+  },
 ];
 
 const bodyTypes = ['슬림', '균형', '하체 발달', '상체 발달'];
 const preferences = ['타이트', '정핏', '여유', '오버핏'];
+const optionalMeasurementKeys: MeasurementKey[] = ['shoulder', 'chest', 'waist', 'hip', 'inseam', 'arm'];
 
 const toNumber = (value: string) => Number(value.replace(/[^0-9.]/g, '')) || 0;
 
-function getFitScore(measurements: Measurements, garment: Garment, preference: string) {
-  const chest = toNumber(measurements.chest);
-  const shoulder = toNumber(measurements.shoulder);
-  const waist = toNumber(measurements.waist);
-  const hip = toNumber(measurements.hip);
+function estimateMeasurements(measurements: Measurements, bodyType: string): Measurements {
+  const height = toNumber(measurements.height) || 168;
+  const weight = toNumber(measurements.weight) || Math.round((height / 100) ** 2 * 21);
+  const bodyAdjustments = {
+    shoulder: bodyType === '상체 발달' ? 2 : bodyType === '하체 발달' ? -1 : bodyType === '슬림' ? -1 : 0,
+    chest: bodyType === '상체 발달' ? 5 : bodyType === '슬림' ? -3 : 0,
+    waist: bodyType === '슬림' ? -4 : bodyType === '상체 발달' ? 2 : 0,
+    hip: bodyType === '하체 발달' ? 5 : bodyType === '슬림' ? -3 : 0,
+  };
+
+  const estimated = {
+    height,
+    weight,
+    shoulder: height * 0.225 + bodyAdjustments.shoulder,
+    chest: height * 0.5 + weight * 0.05 + bodyAdjustments.chest,
+    waist: height * 0.36 + weight * 0.16 + bodyAdjustments.waist,
+    hip: height * 0.49 + weight * 0.2 + bodyAdjustments.hip,
+    inseam: height * 0.44,
+    arm: height * 0.34,
+  };
+
+  return {
+    height: String(Math.round(estimated.height)),
+    weight: String(Math.round(estimated.weight)),
+    shoulder: String(Math.round(estimated.shoulder)),
+    chest: String(Math.round(estimated.chest)),
+    waist: String(Math.round(estimated.waist)),
+    hip: String(Math.round(estimated.hip)),
+    inseam: String(Math.round(estimated.inseam)),
+    arm: String(Math.round(estimated.arm)),
+  };
+}
+
+function getEffectiveMeasurements(measurements: Measurements, bodyType: string): Measurements {
+  const estimates = estimateMeasurements(measurements, bodyType);
+
+  return fields.reduce((profile, field) => {
+    const entered = toNumber(measurements[field.key]);
+    return {
+      ...profile,
+      [field.key]: entered > 0 ? measurements[field.key] : estimates[field.key],
+    };
+  }, {} as Measurements);
+}
+
+function isEstimated(key: MeasurementKey, measurements: Measurements) {
+  return optionalMeasurementKeys.includes(key) && toNumber(measurements[key]) === 0;
+}
+
+function getFitScore(effectiveMeasurements: Measurements, garment: Garment, preference: string) {
+  const chest = toNumber(effectiveMeasurements.chest);
+  const shoulder = toNumber(effectiveMeasurements.shoulder);
+  const waist = toNumber(effectiveMeasurements.waist);
+  const hip = toNumber(effectiveMeasurements.hip);
   const idealEase = preference === '타이트' ? 3 : preference === '정핏' ? 7 : preference === '여유' ? 11 : 16;
 
   const scored = garment.sizes.map((size) => {
@@ -151,25 +251,29 @@ export default function App() {
   const [bodyType, setBodyType] = useState('균형');
   const [preference, setPreference] = useState('정핏');
   const [selectedId, setSelectedId] = useState(garments[0].id);
+  const [activeGuideKey, setActiveGuideKey] = useState<MeasurementKey>('shoulder');
 
   const selected = garments.find((garment) => garment.id === selectedId) ?? garments[0];
+  const effectiveMeasurements = useMemo(
+    () => getEffectiveMeasurements(measurements, bodyType),
+    [measurements, bodyType],
+  );
   const recommendation = useMemo(
-    () => getFitScore(measurements, selected, preference),
-    [measurements, selected, preference],
+    () => getFitScore(effectiveMeasurements, selected, preference),
+    [effectiveMeasurements, selected, preference],
   );
 
-  const chestEase = recommendation.chest ? recommendation.chest - toNumber(measurements.chest) : undefined;
-  const waistEase = recommendation.waist ? recommendation.waist - toNumber(measurements.waist) : undefined;
-  const hipEase = recommendation.hip ? recommendation.hip - toNumber(measurements.hip) : undefined;
+  const chestEase = recommendation.chest ? recommendation.chest - toNumber(effectiveMeasurements.chest) : undefined;
+  const waistEase = recommendation.waist ? recommendation.waist - toNumber(effectiveMeasurements.waist) : undefined;
+  const hipEase = recommendation.hip ? recommendation.hip - toNumber(effectiveMeasurements.hip) : undefined;
   const shoulderEase = recommendation.shoulder
-    ? recommendation.shoulder - toNumber(measurements.shoulder)
+    ? recommendation.shoulder - toNumber(effectiveMeasurements.shoulder)
     : undefined;
 
-  const completion = Math.round(
-    (Object.values(measurements).filter((value) => toNumber(value) > 0).length / fields.length) * 100,
-  );
+  const measuredOptionalCount = optionalMeasurementKeys.filter((key) => toNumber(measurements[key]) > 0).length;
+  const activeGuide = fields.find((field) => field.key === activeGuideKey) ?? fields[2];
 
-  const updateMeasurement = (key: keyof Measurements, value: string) => {
+  const updateMeasurement = (key: MeasurementKey, value: string) => {
     setMeasurements((current) => ({ ...current, [key]: value }));
   };
 
@@ -184,7 +288,7 @@ export default function App() {
           </View>
           <View style={styles.scorePill}>
             <Text style={styles.scoreIcon}>◎</Text>
-            <Text style={styles.scoreText}>{completion}%</Text>
+            <Text style={styles.scoreText}>실측 {measuredOptionalCount}/6</Text>
           </View>
         </View>
 
@@ -204,11 +308,15 @@ export default function App() {
             </View>
           </View>
           <View style={styles.avatarStage}>
-            <View style={[styles.shoulderLine, { width: Math.max(78, toNumber(measurements.shoulder) * 2.35) }]} />
-            <View style={[styles.torso, { width: Math.max(74, toNumber(measurements.chest) * 0.88) }]}>
-              <View style={[styles.waistLine, { width: Math.max(52, toNumber(measurements.waist) * 0.82) }]} />
+            <View
+              style={[styles.shoulderLine, { width: Math.max(78, toNumber(effectiveMeasurements.shoulder) * 2.35) }]}
+            />
+            <View style={[styles.torso, { width: Math.max(74, toNumber(effectiveMeasurements.chest) * 0.88) }]}>
+              <View
+                style={[styles.waistLine, { width: Math.max(52, toNumber(effectiveMeasurements.waist) * 0.82) }]}
+              />
             </View>
-            <View style={[styles.hipLine, { width: Math.max(76, toNumber(measurements.hip) * 0.83) }]} />
+            <View style={[styles.hipLine, { width: Math.max(76, toNumber(effectiveMeasurements.hip) * 0.83) }]} />
             <View style={styles.legs}>
               <View style={styles.leg} />
               <View style={styles.leg} />
@@ -230,26 +338,49 @@ export default function App() {
 
         <View style={styles.sectionHeader}>
           <Text style={styles.sectionTitle}>상세 체형 입력</Text>
-          <Text style={styles.sectionHint}>8개 치수</Text>
+          <Text style={styles.sectionHint}>선택 치수는 자동 추정</Text>
         </View>
 
         <View style={styles.measureGrid}>
-          {fields.map((field) => (
-            <View key={field.key} style={styles.inputCell}>
-              <Text style={styles.inputLabel}>{field.label}</Text>
-              <View style={styles.inputRow}>
-                <TextInput
-                  keyboardType="decimal-pad"
-                  value={measurements[field.key]}
-                  onChangeText={(value) => updateMeasurement(field.key, value)}
-                  style={styles.input}
-                  maxLength={5}
-                  selectionColor="#119C83"
-                />
-                <Text style={styles.unit}>{field.unit}</Text>
-              </View>
-            </View>
-          ))}
+          {fields.map((field) => {
+            const estimated = isEstimated(field.key, measurements);
+            return (
+              <Pressable
+                key={field.key}
+                onPress={() => setActiveGuideKey(field.key)}
+                style={[styles.inputCell, activeGuideKey === field.key && styles.inputCellActive]}
+              >
+                <View style={styles.inputLabelRow}>
+                  <Text style={styles.inputLabel}>{field.label}</Text>
+                  <Text style={[styles.inputBadge, estimated && styles.inputBadgeEstimated]}>
+                    {field.required ? '필수' : estimated ? '추정' : '실측'}
+                  </Text>
+                </View>
+                <View style={styles.inputRow}>
+                  <TextInput
+                    keyboardType="decimal-pad"
+                    value={measurements[field.key]}
+                    onChangeText={(value) => updateMeasurement(field.key, value)}
+                    onFocus={() => setActiveGuideKey(field.key)}
+                    style={styles.input}
+                    placeholder={estimated ? effectiveMeasurements[field.key] : ''}
+                    placeholderTextColor="#A7ADA3"
+                    maxLength={5}
+                    selectionColor="#119C83"
+                  />
+                  <Text style={styles.unit}>{field.unit}</Text>
+                </View>
+              </Pressable>
+            );
+          })}
+        </View>
+
+        <View style={styles.guidePanel}>
+          <View style={styles.guideHeader}>
+            <Text style={styles.guideTitle}>{activeGuide.label} 재는 법</Text>
+            {!activeGuide.required && <Text style={styles.guideTag}>비워두면 추정</Text>}
+          </View>
+          <Text style={styles.guideText}>{activeGuide.guide}</Text>
         </View>
 
         <View style={styles.sectionHeader}>
@@ -311,20 +442,23 @@ export default function App() {
             <View style={[styles.confidenceFill, { width: `${recommendation.score}%` }]} />
           </View>
           <Text style={styles.confidenceText}>예상 만족도 {recommendation.score}%</Text>
+          {measuredOptionalCount < optionalMeasurementKeys.length && (
+            <Text style={styles.estimateNote}>* 표시된 부위는 키, 몸무게, 체형을 바탕으로 임시 추정했습니다.</Text>
+          )}
 
           <View style={styles.fitRows}>
             {[
-              { label: '가슴', value: chestEase },
-              { label: '어깨', value: shoulderEase },
-              { label: '허리', value: waistEase },
-              { label: '엉덩이', value: hipEase },
+              { label: '가슴', value: chestEase, estimated: isEstimated('chest', measurements) },
+              { label: '어깨', value: shoulderEase, estimated: isEstimated('shoulder', measurements) },
+              { label: '허리', value: waistEase, estimated: isEstimated('waist', measurements) },
+              { label: '엉덩이', value: hipEase, estimated: isEstimated('hip', measurements) },
             ]
               .filter((row) => row.value !== undefined)
               .map((row) => {
                 const status = fitStatus(row.value ?? 0);
                 return (
                   <View key={row.label} style={styles.fitRow}>
-                    <Text style={styles.fitPart}>{row.label}</Text>
+                    <Text style={styles.fitPart}>{row.estimated ? `${row.label}*` : row.label}</Text>
                     <View style={styles.fitMeter}>
                       <View
                         style={[
@@ -558,11 +692,35 @@ const styles = StyleSheet.create({
     padding: 12,
     width: '48.5%',
   },
+  inputCellActive: {
+    borderColor: '#119C83',
+    borderWidth: 2,
+    padding: 11,
+  },
+  inputLabelRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
   inputLabel: {
     color: '#72766D',
     fontSize: 12,
     fontWeight: '800',
-    marginBottom: 6,
+  },
+  inputBadge: {
+    backgroundColor: '#EEF1EA',
+    borderRadius: 999,
+    color: '#60665D',
+    fontSize: 10,
+    fontWeight: '900',
+    overflow: 'hidden',
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+  },
+  inputBadgeEstimated: {
+    backgroundColor: '#FFF1D8',
+    color: '#A76700',
   },
   inputRow: {
     alignItems: 'center',
@@ -579,6 +737,36 @@ const styles = StyleSheet.create({
     color: '#119C83',
     fontSize: 12,
     fontWeight: '900',
+  },
+  guidePanel: {
+    backgroundColor: '#FFFFFF',
+    borderColor: '#DDE3D7',
+    borderRadius: 8,
+    borderWidth: 1,
+    marginTop: 10,
+    padding: 14,
+  },
+  guideHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 7,
+  },
+  guideTitle: {
+    color: '#111827',
+    fontSize: 15,
+    fontWeight: '900',
+  },
+  guideTag: {
+    color: '#119C83',
+    fontSize: 11,
+    fontWeight: '900',
+  },
+  guideText: {
+    color: '#60665D',
+    fontSize: 13,
+    fontWeight: '700',
+    lineHeight: 19,
   },
   preferenceRow: {
     flexDirection: 'row',
@@ -724,6 +912,13 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '800',
     marginTop: 8,
+  },
+  estimateNote: {
+    color: '#AAB4C2',
+    fontSize: 11,
+    fontWeight: '700',
+    lineHeight: 16,
+    marginTop: 7,
   },
   fitRows: {
     gap: 12,
