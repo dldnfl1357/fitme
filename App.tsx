@@ -1,6 +1,9 @@
 import { StatusBar } from 'expo-status-bar';
+import * as ImagePicker from 'expo-image-picker';
 import { useMemo, useState } from 'react';
 import {
+  Alert,
+  Image,
   Platform,
   Pressable,
   SafeAreaView,
@@ -24,6 +27,7 @@ type Measurements = {
 };
 
 type MeasurementKey = keyof Measurements;
+type PhotoRole = 'face' | 'body';
 
 type Garment = {
   id: string;
@@ -253,6 +257,8 @@ export default function App() {
   const [preference, setPreference] = useState('정핏');
   const [selectedId, setSelectedId] = useState(garments[0].id);
   const [activeGuideKey, setActiveGuideKey] = useState<MeasurementKey>('shoulder');
+  const [faceImageUri, setFaceImageUri] = useState<string | null>(null);
+  const [bodyImageUri, setBodyImageUri] = useState<string | null>(null);
 
   const selected = garments.find((garment) => garment.id === selectedId) ?? garments[0];
   const effectiveMeasurements = useMemo(
@@ -278,6 +284,25 @@ export default function App() {
     setMeasurements((current) => ({ ...current, [key]: value }));
   };
 
+  const pickPhoto = async (role: PhotoRole) => {
+    const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permissionResult.granted) {
+      Alert.alert('사진 접근 권한 필요', '내 실제 모델을 만들려면 사진 보관함 접근 권한이 필요합니다.');
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      allowsEditing: true,
+      aspect: role === 'face' ? [1, 1] : [9, 16],
+      quality: 0.92,
+    });
+
+    if (result.canceled || !result.assets[0]) return;
+    if (role === 'face') setFaceImageUri(result.assets[0].uri);
+    else setBodyImageUri(result.assets[0].uri);
+  };
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar style="dark" />
@@ -299,11 +324,13 @@ export default function App() {
               measurements={effectiveMeasurements}
               garmentColor={selected.color}
               garmentCategory={selected.category}
+              faceImageUri={faceImageUri}
+              bodyImageUri={bodyImageUri}
             />
           </View>
           <View style={styles.heroCopy}>
-            <Text style={styles.heroLabel}>3D body profile</Text>
-            <Text style={styles.heroTitle}>입력한 치수로 실제 체형 모델을 렌더링합니다.</Text>
+            <Text style={styles.heroLabel}>personal 3D model</Text>
+            <Text style={styles.heroTitle}>얼굴과 전신 사진을 반영해 내 실제 모델에 가깝게 렌더링합니다.</Text>
             <View style={styles.metaRow}>
               <View style={styles.metaItem}>
                 <Text style={styles.metaValue}>{bodyType}</Text>
@@ -313,6 +340,22 @@ export default function App() {
                 <Text style={styles.metaValue}>{preference}</Text>
                 <Text style={styles.metaLabel}>선호 핏</Text>
               </View>
+            </View>
+            <View style={styles.photoPanel}>
+              <PhotoPickerCard
+                label="얼굴"
+                guide="정면 얼굴"
+                imageUri={faceImageUri}
+                onPick={() => pickPhoto('face')}
+                onClear={() => setFaceImageUri(null)}
+              />
+              <PhotoPickerCard
+                label="전신"
+                guide="정면 전신"
+                imageUri={bodyImageUri}
+                onPick={() => pickPhoto('body')}
+                onClear={() => setBodyImageUri(null)}
+              />
             </View>
           </View>
         </View>
@@ -483,6 +526,41 @@ export default function App() {
   );
 }
 
+function PhotoPickerCard({
+  label,
+  guide,
+  imageUri,
+  onPick,
+  onClear,
+}: {
+  label: string;
+  guide: string;
+  imageUri: string | null;
+  onPick: () => void;
+  onClear: () => void;
+}) {
+  return (
+    <View style={styles.photoCard}>
+      <Pressable onPress={onPick} style={styles.photoPreview}>
+        {imageUri ? (
+          <Image source={{ uri: imageUri }} style={styles.photoImage} />
+        ) : (
+          <Text style={styles.photoAdd}>+</Text>
+        )}
+      </Pressable>
+      <View style={styles.photoTextBlock}>
+        <Text style={styles.photoLabel}>{label} 사진</Text>
+        <Text style={styles.photoGuide}>{imageUri ? '모델 반영 중' : guide}</Text>
+      </View>
+      {imageUri && (
+        <Pressable onPress={onClear} style={styles.photoClear}>
+          <Text style={styles.photoClearText}>×</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
@@ -580,6 +658,70 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '700',
     marginTop: 3,
+  },
+  photoPanel: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 14,
+  },
+  photoCard: {
+    alignItems: 'center',
+    backgroundColor: '#FFFFFF',
+    borderColor: '#DDE3D7',
+    borderRadius: 8,
+    borderWidth: 1,
+    flex: 1,
+    flexDirection: 'row',
+    minHeight: 62,
+    padding: 8,
+  },
+  photoPreview: {
+    alignItems: 'center',
+    backgroundColor: '#EEF1EA',
+    borderRadius: 7,
+    height: 46,
+    justifyContent: 'center',
+    overflow: 'hidden',
+    width: 46,
+  },
+  photoImage: {
+    height: '100%',
+    width: '100%',
+  },
+  photoAdd: {
+    color: '#119C83',
+    fontSize: 26,
+    fontWeight: '900',
+    lineHeight: 30,
+  },
+  photoTextBlock: {
+    flex: 1,
+    paddingHorizontal: 10,
+  },
+  photoLabel: {
+    color: '#111827',
+    fontSize: 13,
+    fontWeight: '900',
+  },
+  photoGuide: {
+    color: '#72766D',
+    fontSize: 11,
+    fontWeight: '800',
+    marginTop: 3,
+  },
+  photoClear: {
+    alignItems: 'center',
+    backgroundColor: '#111827',
+    borderRadius: 999,
+    height: 28,
+    justifyContent: 'center',
+    width: 28,
+  },
+  photoClearText: {
+    color: '#FFFFFF',
+    fontSize: 20,
+    fontWeight: '800',
+    lineHeight: 22,
   },
   avatarStage: {
     alignItems: 'center',

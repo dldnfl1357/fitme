@@ -16,6 +16,8 @@ type BodyModel3DProps = {
   measurements: BodyModelMeasurements;
   garmentColor: string;
   garmentCategory: 'Top' | 'Bottom' | 'Outer';
+  faceImageUri?: string | null;
+  bodyImageUri?: string | null;
 };
 
 const toNumber = (value: string) => Number(value.replace(/[^0-9.]/g, '')) || 0;
@@ -46,7 +48,7 @@ function createTorsoGeometry(shoulder: number, chest: number, waist: number, hip
     { y: torsoHeight * 0.2, width: chest * 0.0073, depth: chest * 0.0042 },
     { y: torsoHeight * 0.5, width: shoulder * 0.014, depth: chest * 0.0037 },
   ];
-  const segments = 36;
+  const segments = 48;
   const positions: number[] = [];
   const normals: number[] = [];
   const indices: number[] = [];
@@ -80,10 +82,20 @@ function createTorsoGeometry(shoulder: number, chest: number, waist: number, hip
   return geometry;
 }
 
+function createPhotoTexture(uri?: string | null) {
+  if (!uri) return undefined;
+  const texture = new THREE.TextureLoader().load(uri);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = 8;
+  return texture;
+}
+
 function createModel({
   measurements,
   garmentColor,
   garmentCategory,
+  faceImageUri,
+  bodyImageUri,
 }: BodyModel3DProps) {
   const group = new THREE.Group();
   const height = cm(measurements.height, 168);
@@ -99,6 +111,8 @@ function createModel({
   const armLength = THREE.MathUtils.clamp(arm / 57, 0.82, 1.2) * 1.08;
   const shoulderHalf = shoulder * 0.014;
   const hipHalf = hip * 0.0047;
+  const faceTexture = createPhotoTexture(faceImageUri);
+  const bodyTexture = createPhotoTexture(bodyImageUri);
 
   const skin = new THREE.MeshStandardMaterial({
     color: '#D8A17F',
@@ -116,6 +130,28 @@ function createModel({
     transparent: true,
     opacity: garmentCategory === 'Outer' ? 0.86 : 0.78,
   });
+  const contour = new THREE.MeshStandardMaterial({
+    color: '#B9765D',
+    roughness: 0.82,
+    transparent: true,
+    opacity: 0.34,
+  });
+
+  if (bodyTexture) {
+    const bodyPhoto = new THREE.Mesh(
+      new THREE.PlaneGeometry(1.18 * bodyScale, 2.65 * bodyScale),
+      new THREE.MeshBasicMaterial({
+        map: bodyTexture,
+        transparent: true,
+        opacity: 0.32,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      }),
+    );
+    bodyPhoto.position.set(0, -0.28, -0.28);
+    bodyPhoto.renderOrder = 0;
+    group.add(bodyPhoto);
+  }
 
   const torso = new THREE.Mesh(createTorsoGeometry(shoulder, chest, waist, hip, torsoHeight), skin);
   torso.position.y = 0.1;
@@ -133,11 +169,45 @@ function createModel({
   head.castShadow = true;
   group.add(head);
 
+  const hair = new THREE.Mesh(
+    new THREE.SphereGeometry(0.255 * bodyScale, 32, 12, 0, Math.PI * 2, 0, Math.PI * 0.56),
+    new THREE.MeshStandardMaterial({ color: '#171717', roughness: 0.76 }),
+  );
+  hair.scale.set(0.84, 0.64, 0.8);
+  hair.position.set(0, torsoHeight * 0.5 + 0.72, 0.015);
+  group.add(hair);
+
+  if (faceTexture) {
+    const face = new THREE.Mesh(
+      new THREE.CircleGeometry(0.205 * bodyScale, 64),
+      new THREE.MeshBasicMaterial({
+        map: faceTexture,
+        transparent: true,
+        side: THREE.DoubleSide,
+      }),
+    );
+    face.scale.set(0.9, 1.08, 1);
+    face.position.set(0, torsoHeight * 0.5 + 0.57, 0.205 * bodyScale);
+    face.renderOrder = 3;
+    group.add(face);
+  } else {
+    const eyeMaterial = new THREE.MeshStandardMaterial({ color: '#111827', roughness: 0.55 });
+    const mouthMaterial = new THREE.MeshStandardMaterial({ color: '#8A4A43', roughness: 0.7 });
+    const leftEye = new THREE.Mesh(new THREE.SphereGeometry(0.018 * bodyScale, 12, 8), eyeMaterial);
+    leftEye.position.set(-0.07 * bodyScale, torsoHeight * 0.5 + 0.6, 0.19 * bodyScale);
+    const rightEye = leftEye.clone();
+    rightEye.position.x = 0.07 * bodyScale;
+    const mouth = new THREE.Mesh(new THREE.BoxGeometry(0.1 * bodyScale, 0.014 * bodyScale, 0.012 * bodyScale), mouthMaterial);
+    mouth.position.set(0, torsoHeight * 0.5 + 0.5, 0.205 * bodyScale);
+    group.add(leftEye, rightEye, mouth);
+  }
+
   const shoulderY = torsoHeight * 0.5;
   const wristY = shoulderY - armLength;
   const armRadius = 0.065 * bodyScale;
   group.add(capsuleBetween(new THREE.Vector3(-shoulderHalf, shoulderY, 0), new THREE.Vector3(-shoulderHalf - 0.18, wristY, 0.04), armRadius, skin));
   group.add(capsuleBetween(new THREE.Vector3(shoulderHalf, shoulderY, 0), new THREE.Vector3(shoulderHalf + 0.18, wristY, 0.04), armRadius, skin));
+  group.add(capsuleBetween(new THREE.Vector3(-shoulderHalf * 0.76, shoulderY - 0.05, 0.02), new THREE.Vector3(shoulderHalf * 0.76, shoulderY - 0.05, 0.02), 0.026 * bodyScale, contour, 24));
 
   const hipY = -torsoHeight * 0.5;
   const ankleY = hipY - legLength;
@@ -163,6 +233,13 @@ function createModel({
     );
     fitLine.position.set(shoulderHalf * 0.32, 0.2, chest * 0.0045);
     group.add(fitLine);
+
+    const garmentHighlight = new THREE.Mesh(
+      new THREE.PlaneGeometry(shoulderHalf * 0.92, torsoHeight * 0.58),
+      new THREE.MeshBasicMaterial({ color: '#FFFFFF', transparent: true, opacity: 0.12, depthWrite: false }),
+    );
+    garmentHighlight.position.set(-shoulderHalf * 0.16, 0.2, chest * 0.0049);
+    group.add(garmentHighlight);
   }
 
   if (garmentCategory !== 'Top') {
@@ -194,10 +271,26 @@ function createModel({
   floor.receiveShadow = true;
   group.add(floor);
 
-  group.position.x = -1.05;
-  group.position.y = 1.28;
-  group.scale.setScalar(0.24);
+  group.position.x = 0;
+  group.position.y = 0.2;
+  group.scale.setScalar(0.92);
   return group;
+}
+
+function disposeModel(root: THREE.Object3D) {
+  root.traverse((object) => {
+    if (object instanceof THREE.Mesh) {
+      object.geometry.dispose();
+      const material = object.material;
+      const disposeMaterial = (item: THREE.Material) => {
+        const mapped = item as THREE.Material & { map?: THREE.Texture };
+        mapped.map?.dispose();
+        item.dispose();
+      };
+      if (Array.isArray(material)) material.forEach(disposeMaterial);
+      else disposeMaterial(material);
+    }
+  });
 }
 
 export default function BodyModel3D(props: BodyModel3DProps) {
@@ -217,7 +310,7 @@ export default function BodyModel3D(props: BodyModel3DProps) {
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, preserveDrawingBuffer: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
     host.appendChild(renderer.domElement);
 
     const keyLight = new THREE.DirectionalLight('#FFFFFF', 2.4);
@@ -282,14 +375,7 @@ export default function BodyModel3D(props: BodyModel3DProps) {
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerup', onPointerUp);
       renderer.dispose();
-      scene.traverse((object) => {
-        if (object instanceof THREE.Mesh) {
-          object.geometry.dispose();
-          const material = object.material;
-          if (Array.isArray(material)) material.forEach((item) => item.dispose());
-          else material.dispose();
-        }
-      });
+      disposeModel(scene);
       host.removeChild(renderer.domElement);
     };
   }, []);
@@ -299,19 +385,12 @@ export default function BodyModel3D(props: BodyModel3DProps) {
     if (!current || !current.parent) return;
     const parent = current.parent;
     parent.remove(current);
-    current.traverse((object) => {
-      if (object instanceof THREE.Mesh) {
-        object.geometry.dispose();
-        const material = object.material;
-        if (Array.isArray(material)) material.forEach((item) => item.dispose());
-        else material.dispose();
-      }
-    });
+    disposeModel(current);
     const next = createModel(props);
     next.rotation.y = current.rotation.y;
     modelRef.current = next;
     parent.add(next);
-  }, [props.garmentCategory, props.garmentColor, props.measurements]);
+  }, [props.bodyImageUri, props.faceImageUri, props.garmentCategory, props.garmentColor, props.measurements]);
 
   return (
     <div style={domStyles.stage}>
