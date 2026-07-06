@@ -1,6 +1,7 @@
 import { StatusBar } from 'expo-status-bar';
+import { FilesetResolver, FaceLandmarker } from '@mediapipe/tasks-vision';
 import * as ImagePicker from 'expo-image-picker';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   Image,
@@ -28,6 +29,23 @@ type Measurements = {
 
 type MeasurementKey = keyof Measurements;
 type PhotoRole = 'face' | 'body';
+
+type BodyType = '슬림' | '균형' | '하체 발달' | '상체 발달';
+
+type FaceAnalysis = {
+  confidence: number;
+  ratio: number;
+  fullness: number;
+  widthAtForehead: number;
+  widthAtJaw: number;
+  jawSharpness: number;
+};
+
+type BodyProfile = {
+  bodyType: BodyType;
+  confidence: number;
+  faceAnalysis: FaceAnalysis;
+};
 
 type Garment = {
   id: string;
@@ -168,31 +186,419 @@ const fields: {
   },
 ];
 
-const bodyTypes = ['슬림', '균형', '하체 발달', '상체 발달'];
 const preferences = ['타이트', '정핏', '여유', '오버핏'];
 const optionalMeasurementKeys: MeasurementKey[] = ['shoulder', 'chest', 'waist', 'hip', 'inseam', 'arm'];
+const BODY_TYPE_FACTORS: Record<
+  string,
+  { shoulder: number; chest: number; waist: number; hip: number; inseam: number; arm: number }
+> = {
+  슬림: { shoulder: -1.2, chest: -2.8, waist: -4.2, hip: -3.0, inseam: -0.8, arm: -1.0 },
+  균형: { shoulder: 0, chest: 0, waist: 0, hip: 0, inseam: 0, arm: 0 },
+  '하체 발달': { shoulder: -0.6, chest: 1.0, waist: 3.2, hip: 5.2, inseam: 0.9, arm: 0 },
+  '상체 발달': { shoulder: 1.4, chest: 3.2, waist: 2.0, hip: 1.3, inseam: -0.4, arm: 0.4 },
+};
+
+const DEFAULT_FACE_ANALYSIS: FaceAnalysis = {
+  confidence: 0.2,
+  ratio: 1.08,
+  fullness: 0.5,
+  widthAtForehead: 1,
+  widthAtJaw: 1,
+  jawSharpness: 0,
+};
+
+const DEFAULT_BODY_PROFILE: BodyProfile = {
+  bodyType: '균형',
+  confidence: 0,
+  faceAnalysis: DEFAULT_FACE_ANALYSIS,
+};
+
+const FACE_SIGNAL_BASELINE = {
+  ratio: 1.08,
+  fullness: 0.5,
+  jawSharpness: 0,
+};
+
+const MEDIAPIPE_WASM_CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm';
+const MEDIAPIPE_FACE_LANDMARKER_TASK_URL =
+  'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+
+type FaceLandmarkerInstance = FaceLandmarker | null;
+
+let faceLandmarkerPromise: Promise<FaceLandmarkerInstance> | null = null;
 
 const toNumber = (value: string) => Number(value.replace(/[^0-9.]/g, '')) || 0;
 
-function estimateMeasurements(measurements: Measurements, bodyType: string): Measurements {
-  const height = toNumber(measurements.height) || 168;
-  const weight = toNumber(measurements.weight) || Math.round((height / 100) ** 2 * 21);
-  const bodyAdjustments = {
-    shoulder: bodyType === '상체 발달' ? 2 : bodyType === '하체 발달' ? -1 : bodyType === '슬림' ? -1 : 0,
-    chest: bodyType === '상체 발달' ? 5 : bodyType === '슬림' ? -3 : 0,
-    waist: bodyType === '슬림' ? -4 : bodyType === '상체 발달' ? 2 : 0,
-    hip: bodyType === '하체 발달' ? 5 : bodyType === '슬림' ? -3 : 0,
+function median(values: number[]) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const center = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[center] : (sorted[center - 1] + sorted[center]) / 2;
+}
+
+function normalize01(value: number) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function getCanvasImage(uri: string): Promise<HTMLImageElement> {
+  if (typeof window === 'undefined') return Promise.reject(new Error('not-web'));
+
+  const env = globalThis as any;
+  const ImageCtor = env.Image;
+  if (!ImageCtor) return Promise.reject(new Error('no-image'));
+
+  return new Promise((resolve, reject) => {
+    const image = new ImageCtor();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('image-load-failed'));
+    image.crossOrigin = 'anonymous';
+    image.src = uri;
+  });
+}
+
+function spreadForYBand(points: { x: number; y: number; z: number }[], minY: number, maxY: number) {
+  const rows = points.filter((point) => point.y >= minY && point.y <= maxY);
+  if (!rows.length) return 0;
+  let minX = 1;
+  let maxX = 0;
+  for (const point of rows) {
+    minX = Math.min(minX, point.x);
+    maxX = Math.max(maxX, point.x);
+  }
+  return Math.max(0, maxX - minX);
+}
+
+function clampLandmarkSpan(span: number, fallback: number) {
+  return span > 0 && Number.isFinite(span) ? span : fallback;
+}
+
+function average(values: number[]) {
+  if (!values.length) return 0;
+  return values.reduce((acc, value) => acc + value, 0) / values.length;
+}
+
+function getFaceBodyBias(faceAnalysis: FaceAnalysis) {
+  const influence = clampNumber((faceAnalysis.confidence - 0.3) / 0.6, 0, 1);
+  const ratioBias = clampNumber((faceAnalysis.ratio - FACE_SIGNAL_BASELINE.ratio) / 0.32, -1, 1) * influence;
+  const fullnessBias = clampNumber((faceAnalysis.fullness - FACE_SIGNAL_BASELINE.fullness) * 2, -1, 1) * influence;
+  const jawBias = clampNumber(faceAnalysis.jawSharpness - FACE_SIGNAL_BASELINE.jawSharpness, -1, 1) * influence;
+
+  return {
+    influence,
+    ratioBias,
+    fullnessBias,
+    jawBias,
   };
+}
+
+async function getFaceLandmarker() {
+  if (!faceLandmarkerPromise) {
+    faceLandmarkerPromise = (async () => {
+      try {
+        const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_CDN);
+        return FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: MEDIAPIPE_FACE_LANDMARKER_TASK_URL,
+            delegate: 'CPU',
+          },
+          outputFaceBlendshapes: false,
+          runningMode: 'IMAGE',
+          minFaceDetectionConfidence: 0.6,
+          minTrackingConfidence: 0.45,
+          numFaces: 1,
+        } as any) as Promise<FaceLandmarker>;
+      } catch (error) {
+        faceLandmarkerPromise = null;
+        return null;
+      }
+    })();
+  }
+
+  return faceLandmarkerPromise;
+}
+
+async function analyzeFaceImageWithMediaPipe(uri: string): Promise<FaceAnalysis> {
+  try {
+    const landmarker = await getFaceLandmarker();
+    if (!landmarker) return DEFAULT_FACE_ANALYSIS;
+
+    const image = await getCanvasImage(uri);
+    const result = (await landmarker.detect(image)) as {
+      faceLandmarks?: { x: number; y: number; z: number }[][];
+      faceDetections?: { categories?: { score: number }[] }[];
+    };
+
+    const landmarks = result?.faceLandmarks?.[0];
+    if (!landmarks || !landmarks.length) return DEFAULT_FACE_ANALYSIS;
+
+    const xs = landmarks.map((point) => point.x);
+    const ys = landmarks.map((point) => point.y);
+    const zs = landmarks.map((point) => point.z);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    const bboxWidth = maxX - minX;
+    const bboxHeight = Math.max(0.0001, maxY - minY);
+    const forehead = spreadForYBand(landmarks, 0.08, 0.22);
+    const cheek = spreadForYBand(landmarks, 0.38, 0.58);
+    const jaw = spreadForYBand(landmarks, 0.70, 0.90);
+
+    const widthAtForehead = clampLandmarkSpan(forehead, bboxWidth * 0.65);
+    const widthAtJaw = clampLandmarkSpan(jaw, Math.max(widthAtForehead * 0.4, bboxWidth * 0.32));
+    const widthAtCheek = clampLandmarkSpan(cheek, (widthAtForehead + widthAtJaw) * 0.55);
+
+    const widthRatio = clampNumber((bboxWidth / bboxHeight) * 1.35, 0.65, 1.8);
+    const fullness = clampNumber(
+      clampLandmarkSpan((widthAtCheek / Math.max(0.0001, widthAtForehead)) - 0.72, 0) * 1.6,
+      0,
+      1,
+    );
+    const jawSharpness = clampNumber((widthAtJaw / Math.max(0.0001, widthAtForehead) - 0.8) * 3.1, -1, 1);
+    const depthEntropy = average(zs.map((value) => Math.abs(value)));
+    const baseConfidence = result?.faceDetections?.[0]?.categories?.[0]?.score ?? 0.75;
+
+    return {
+      confidence: clampNumber(normalize01(baseConfidence) * 0.75 + normalize01(clampNumber(depthEntropy * 3.2, 0, 1)) * 0.25, 0, 1),
+      ratio: widthRatio,
+      fullness: clampNumber(fullness + Math.max(0, depthEntropy - 0.32) * 0.35, 0, 1),
+      widthAtForehead: Math.max(1, Math.round(widthAtForehead * 1000)),
+      widthAtJaw: Math.max(1, Math.round(widthAtJaw * 1000)),
+      jawSharpness,
+    };
+  } catch {
+    return DEFAULT_FACE_ANALYSIS;
+  }
+}
+
+function isSkinPixel(r: number, g: number, b: number) {
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const diff = max - min;
+  if (max < 45 || max > 250) return false;
+  if (diff < 10) return false;
+  if (r <= g || b > g + 22) return false;
+  const y = 0.299 * r + 0.587 * g + 0.114 * b;
+  const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+  const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+  if (cr < 130 || cr > 172) return false;
+  if (cb < 77 || cb > 127) return false;
+  return y > 55 && y < 240;
+}
+
+async function analyzeFaceImage(uri: string): Promise<FaceAnalysis> {
+  if (typeof window === 'undefined') return DEFAULT_FACE_ANALYSIS;
+
+  const mpAnalysis = await analyzeFaceImageWithMediaPipe(uri);
+  if (mpAnalysis.confidence >= 0.35) {
+    return mpAnalysis;
+  }
+
+  return analyzeFaceImageWithSkin(uri);
+}
+
+function analyzeFaceImageWithSkin(uri: string): Promise<FaceAnalysis> {
+  if (typeof window === 'undefined') return Promise.resolve(DEFAULT_FACE_ANALYSIS);
+
+  const env = globalThis as any;
+  const ImageCtor = env.Image;
+  if (!ImageCtor || !env.document) return Promise.resolve(DEFAULT_FACE_ANALYSIS);
+
+  return new Promise((resolve) => {
+    const image = new ImageCtor();
+    image.onload = () => {
+      try {
+        const canvas = env.document.createElement('canvas');
+        const context = canvas.getContext('2d');
+        if (!context) {
+          resolve(DEFAULT_FACE_ANALYSIS);
+          return;
+        }
+
+        const width = Math.max(1, Number(image.naturalWidth || image.width || 0));
+        const height = Math.max(1, Number(image.naturalHeight || image.height || 0));
+        const side = Math.max(width, height);
+        const scale = Math.min(1, 320 / side);
+        canvas.width = Math.max(1, Math.round(width * scale));
+        canvas.height = Math.max(1, Math.round(height * scale));
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+        const cropW = Math.max(1, Math.floor(Math.min(canvas.width, canvas.height) * 0.82));
+        const cropH = Math.max(1, Math.floor(cropW * 1.18));
+        const sx = Math.max(0, Math.floor((canvas.width - cropW) / 2));
+        const sy = Math.max(0, Math.floor((canvas.height - cropH) / 3));
+
+        if (sx + cropW > canvas.width || sy + cropH > canvas.height) {
+          resolve(DEFAULT_FACE_ANALYSIS);
+          return;
+        }
+
+        const imageData = context.getImageData(sx, sy, cropW, cropH);
+        const pixels = imageData.data;
+        const rowWidths = new Array(cropH).fill(0);
+        let minX = cropW;
+        let maxX = -1;
+        let minY = cropH;
+        let maxY = -1;
+        let skinCount = 0;
+
+        for (let y = 0; y < cropH; y += 1) {
+          let left = cropW;
+          let right = -1;
+          for (let x = 0; x < cropW; x += 1) {
+            const idx = (y * cropW + x) * 4;
+            const r = pixels[idx] ?? 0;
+            const g = pixels[idx + 1] ?? 0;
+            const b = pixels[idx + 2] ?? 0;
+            if (isSkinPixel(r, g, b)) {
+              skinCount += 1;
+              left = Math.min(left, x);
+              right = Math.max(right, x);
+              minX = Math.min(minX, x);
+              maxX = Math.max(maxX, x);
+              minY = Math.min(minY, y);
+              maxY = Math.max(maxY, y);
+            }
+          }
+          rowWidths[y] = right >= left ? right - left + 1 : 0;
+        }
+
+        if (skinCount < Math.max(200, cropW * 0.04) || maxX < 0 || maxY < 0) {
+          resolve(DEFAULT_FACE_ANALYSIS);
+          return;
+        }
+
+        const rowDensity = rowWidths.filter((width) => width > 0).length / cropH;
+        const bboxWidth = maxX - minX + 1;
+        const bboxHeight = maxY - minY + 1;
+
+        if (bboxWidth < 10 || bboxHeight < 8) {
+          resolve(DEFAULT_FACE_ANALYSIS);
+          return;
+        }
+
+        const widthAt = (ratio: number) => {
+          const baseY = Math.max(0, Math.min(cropH - 1, Math.round(cropH * ratio)));
+          const sampleRows = [baseY - 1, baseY, baseY + 1].map(
+            (row) => rowWidths[Math.max(0, Math.min(cropH - 1, row))],
+          );
+          return Math.round(median(sampleRows.filter(Boolean)));
+        };
+
+        const forehead = widthAt(0.18);
+        const jaw = widthAt(0.72);
+        const cheek = widthAt(0.45);
+        const faceCountDensity = skinCount / (cropW * cropH);
+        const widthRatio = clampNumber(bboxWidth / Math.max(1, bboxHeight), 0.65, 1.8);
+        const faceFullness = clampNumber((faceCountDensity - 0.065) * 2.8, 0, 1);
+        const jawSharpness = forehead > 0 ? clampNumber((jaw / forehead - 0.85) * 2.8, -1, 1) : 0;
+        const confidence = clampNumber(
+          0.25 + rowDensity * 0.45 + faceFullness * 0.25 + Math.min(1, cheek / Math.max(1, widthRatio * cropW) * 1.3),
+          0,
+          1,
+        );
+
+        resolve({
+          confidence,
+          ratio: widthRatio,
+          fullness: faceFullness,
+          widthAtForehead: Math.max(1, forehead),
+          widthAtJaw: Math.max(1, jaw),
+          jawSharpness,
+        });
+      } catch {
+        resolve(DEFAULT_FACE_ANALYSIS);
+      }
+    };
+
+    image.onerror = () => resolve(DEFAULT_FACE_ANALYSIS);
+    image.crossOrigin = 'anonymous';
+    image.src = uri;
+  });
+}
+
+function inferBodyProfile(measurements: Measurements, faceAnalysis: FaceAnalysis): BodyProfile {
+  const height = clampNumber(toNumber(measurements.height) || 168, 135, 205);
+  const weight = clampNumber(toNumber(measurements.weight) || Math.round((height / 100) ** 2 * 21.4), 33, 160);
+  const bmi = clampNumber(weight / (height / 100) ** 2, 13.5, 40);
+  const bmiShift = (bmi - 21.4) / 14;
+  const faceBias = getFaceBodyBias(faceAnalysis);
+
+  const scores: Record<BodyType, number> = {
+    슬림:
+      1.55 -
+      bmiShift * 1.18 -
+      faceBias.fullnessBias * 0.48 -
+      Math.max(0, faceBias.ratioBias) * 0.38 +
+      Math.max(0, -faceBias.ratioBias) * 0.16,
+    균형: 1.35 - Math.abs(bmiShift) * 1.28 + (1 - Math.abs(faceBias.fullnessBias)) * 0.16,
+    '하체 발달':
+      1.05 +
+      Math.max(0, bmiShift) * 0.78 +
+      faceBias.fullnessBias * 0.46 -
+      Math.max(0, faceBias.ratioBias) * 0.18,
+    '상체 발달':
+      1.08 +
+      Math.max(0, bmiShift) * 0.74 +
+      faceBias.ratioBias * 0.56 +
+      faceBias.jawBias * 0.28 +
+      faceBias.fullnessBias * 0.16,
+  };
+
+  const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  const winner = sorted[0]?.[0] as BodyType;
+  const nextScore = sorted[1]?.[1] ?? sorted[0]?.[1] ?? 0;
+  const confidence =
+    clampNumber((sorted[0]?.[1] ?? 0) - nextScore, 0, 1) * 0.42 +
+    faceAnalysis.confidence * 0.42 +
+    faceBias.influence * 0.16;
+
+  return {
+    bodyType: winner ?? '균형',
+    confidence: clampNumber(confidence, 0, 1),
+    faceAnalysis,
+  };
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function estimateMeasurements(measurements: Measurements, profile: BodyProfile): Measurements {
+  const height = clampNumber(toNumber(measurements.height) || 168, 135, 205);
+  const weight = clampNumber(toNumber(measurements.weight) || Math.round((height / 100) ** 2 * 21.4), 33, 160);
+  const bmi = clampNumber(weight / (height / 100) ** 2, 13.5, 40);
+  const bmiShift = bmi - 21.4;
+  const factors = BODY_TYPE_FACTORS[profile.bodyType] ?? BODY_TYPE_FACTORS.균형;
+  const faceBias = getFaceBodyBias(profile.faceAnalysis);
+  const softMassShift = faceBias.fullnessBias * 2.2;
+  const upperFrameShift = faceBias.ratioBias * 1.55 + faceBias.jawBias * 0.45;
 
   const estimated = {
     height,
     weight,
-    shoulder: height * 0.225 + bodyAdjustments.shoulder,
-    chest: height * 0.5 + weight * 0.05 + bodyAdjustments.chest,
-    waist: height * 0.36 + weight * 0.16 + bodyAdjustments.waist,
-    hip: height * 0.49 + weight * 0.2 + bodyAdjustments.hip,
-    inseam: height * 0.44,
-    arm: height * 0.34,
+    shoulder: clampNumber(
+      height * 0.225 + bmiShift * 0.55 + factors.shoulder + upperFrameShift * 0.8 + softMassShift * 0.24,
+      33,
+      52,
+    ),
+    chest: clampNumber(
+      height * 0.5 + weight * 0.05 + bmiShift * 0.95 + factors.chest + upperFrameShift * 0.95 + softMassShift * 0.48,
+      74,
+      132,
+    ),
+    waist: clampNumber(
+      height * 0.362 + weight * 0.153 + bmiShift * 1.35 + factors.waist + upperFrameShift * 0.28 + softMassShift * 0.76,
+      58,
+      142,
+    ),
+    hip: clampNumber(
+      height * 0.488 + weight * 0.198 + bmiShift * 1.12 + factors.hip + upperFrameShift * 0.16 + softMassShift * 0.9,
+      76,
+      148,
+    ),
+    inseam: clampNumber(height * 0.44 + bmiShift * 0.25 + factors.inseam + softMassShift * 0.08, 60, 112),
+    arm: clampNumber(height * 0.34 + bmiShift * 0.18 + factors.arm + upperFrameShift * 0.1, 49, 78),
   };
 
   return {
@@ -207,8 +613,8 @@ function estimateMeasurements(measurements: Measurements, bodyType: string): Mea
   };
 }
 
-function getEffectiveMeasurements(measurements: Measurements, bodyType: string): Measurements {
-  const estimates = estimateMeasurements(measurements, bodyType);
+function getEffectiveMeasurements(measurements: Measurements, profile: BodyProfile): Measurements {
+  const estimates = estimateMeasurements(measurements, profile);
 
   return fields.reduce((profile, field) => {
     const entered = toNumber(measurements[field.key]);
@@ -253,7 +659,8 @@ function fitStatus(delta: number) {
 
 export default function App() {
   const [measurements, setMeasurements] = useState(initialMeasurements);
-  const [bodyType, setBodyType] = useState('균형');
+  const [faceAnalysis, setFaceAnalysis] = useState<FaceAnalysis>(DEFAULT_FACE_ANALYSIS);
+  const [isAnalyzingFace, setIsAnalyzingFace] = useState(false);
   const [preference, setPreference] = useState('정핏');
   const [selectedId, setSelectedId] = useState(garments[0].id);
   const [activeGuideKey, setActiveGuideKey] = useState<MeasurementKey>('shoulder');
@@ -261,9 +668,14 @@ export default function App() {
   const [bodyImageUri, setBodyImageUri] = useState<string | null>(null);
 
   const selected = garments.find((garment) => garment.id === selectedId) ?? garments[0];
+  const hasCoreInput = toNumber(measurements.height) > 0 && toNumber(measurements.weight) > 0;
+  const profile = useMemo(
+    () => (hasCoreInput ? inferBodyProfile(measurements, faceAnalysis) : DEFAULT_BODY_PROFILE),
+    [faceAnalysis, hasCoreInput, measurements],
+  );
   const effectiveMeasurements = useMemo(
-    () => getEffectiveMeasurements(measurements, bodyType),
-    [measurements, bodyType],
+    () => getEffectiveMeasurements(measurements, profile),
+    [measurements, profile],
   );
   const recommendation = useMemo(
     () => getFitScore(effectiveMeasurements, selected, preference),
@@ -279,10 +691,39 @@ export default function App() {
 
   const measuredOptionalCount = optionalMeasurementKeys.filter((key) => toNumber(measurements[key]) > 0).length;
   const activeGuide = fields.find((field) => field.key === activeGuideKey) ?? fields[2];
+  const bodyTypeLabel = !hasCoreInput
+    ? '입력 대기'
+    : isAnalyzingFace
+    ? '얼굴 분석 중'
+    : `${profile.bodyType} (${Math.round(profile.confidence * 100)}% 신뢰도)`;
 
   const updateMeasurement = (key: MeasurementKey, value: string) => {
     setMeasurements((current) => ({ ...current, [key]: value }));
   };
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!faceImageUri) {
+      setFaceAnalysis(DEFAULT_FACE_ANALYSIS);
+      return;
+    }
+
+    setIsAnalyzingFace(true);
+    analyzeFaceImage(faceImageUri)
+      .then((analysis) => {
+        if (!cancelled) setFaceAnalysis(analysis);
+      })
+      .catch(() => {
+        if (!cancelled) setFaceAnalysis(DEFAULT_FACE_ANALYSIS);
+      })
+      .finally(() => {
+        if (!cancelled) setIsAnalyzingFace(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [faceImageUri]);
 
   const pickPhoto = async (role: PhotoRole) => {
     const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -313,12 +754,17 @@ export default function App() {
             <Text style={styles.title}>내 몸에 맞춰 입어보기</Text>
           </View>
           <View style={styles.scorePill}>
-            <Text style={styles.scoreIcon}>◎</Text>
-            <Text style={styles.scoreText}>실측 {measuredOptionalCount}/6</Text>
+            <Text style={styles.scoreIcon}>AI</Text>
+            <Text style={styles.scoreText}>
+              {hasCoreInput ? `기준 입력 완료 (${measuredOptionalCount}/6 직접입력)` : '키·몸무게 입력 필요'}
+            </Text>
           </View>
         </View>
 
         <View style={styles.hero}>
+          <View style={styles.heroGlow} />
+          <View style={styles.heroGlowSoft} />
+          <View style={styles.heroRibbon} />
           <View style={styles.avatarStage}>
             <BodyModel3D
               measurements={effectiveMeasurements}
@@ -329,11 +775,13 @@ export default function App() {
             />
           </View>
           <View style={styles.heroCopy}>
-            <Text style={styles.heroLabel}>personal 3D model</Text>
-            <Text style={styles.heroTitle}>얼굴과 전신 사진을 반영해 내 실제 모델에 가깝게 렌더링합니다.</Text>
+            <View style={styles.heroLabelWrap}>
+              <Text style={styles.heroLabel}>Personal 3D Avatar</Text>
+            </View>
+            <Text style={styles.heroTitle}>내 체형에 맞춰 입어보는, 사람처럼 보이는 3D 피팅 스튜디오</Text>
             <View style={styles.metaRow}>
               <View style={styles.metaItem}>
-                <Text style={styles.metaValue}>{bodyType}</Text>
+                <Text style={styles.metaValue}>{bodyTypeLabel}</Text>
                 <Text style={styles.metaLabel}>체형</Text>
               </View>
               <View style={styles.metaItem}>
@@ -361,20 +809,15 @@ export default function App() {
         </View>
 
         <View style={styles.segment}>
-          {bodyTypes.map((item) => (
-            <Pressable
-              key={item}
-              onPress={() => setBodyType(item)}
-              style={[styles.segmentButton, bodyType === item && styles.segmentButtonActive]}
-            >
-              <Text style={[styles.segmentText, bodyType === item && styles.segmentTextActive]}>{item}</Text>
-            </Pressable>
-          ))}
+          <View style={[styles.segmentButton, styles.segmentButtonActive, { alignItems: 'center', flex: 1 }]}>
+            <Text style={styles.segmentTextActive}>핵심 입력 기반 체형 자동 판별</Text>
+            <Text style={[styles.segmentTextActive, { color: '#FFFFFF', opacity: 0.95, fontSize: 13, marginTop: 3 }]}>{bodyTypeLabel}</Text>
+          </View>
         </View>
 
         <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>상세 체형 입력</Text>
-          <Text style={styles.sectionHint}>선택 치수는 자동 추정</Text>
+          <Text style={styles.sectionTitle}>체형 자동 생성</Text>
+          <Text style={styles.sectionHint}>{hasCoreInput ? '키·몸무게 + 얼굴로 자동 추정' : '키·몸무게 입력 필요'}</Text>
         </View>
 
         <View style={styles.measureGrid}>
@@ -478,9 +921,11 @@ export default function App() {
             <View style={[styles.confidenceFill, { width: `${recommendation.score}%` }]} />
           </View>
           <Text style={styles.confidenceText}>예상 만족도 {recommendation.score}%</Text>
-          {measuredOptionalCount < optionalMeasurementKeys.length && (
-            <Text style={styles.estimateNote}>* 표시된 부위는 키, 몸무게, 체형을 바탕으로 임시 추정했습니다.</Text>
-          )}
+            {measuredOptionalCount < optionalMeasurementKeys.length && (
+              <Text style={styles.estimateNote}>
+                * 표시된 부위는 키·몸무게·얼굴형(비율/윤곽) 기반으로 추정했습니다.
+              </Text>
+            )}
 
           <View style={styles.fitRows}>
             {[
@@ -564,89 +1009,140 @@ function PhotoPickerCard({
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#F7F8F3',
+    backgroundColor: '#F1F6FF',
   },
   screen: {
     paddingHorizontal: 18,
     paddingBottom: 34,
     paddingTop: Platform.OS === 'android' ? 44 : 14,
+    gap: 16,
   },
   header: {
-    alignItems: 'center',
+    alignItems: 'flex-start',
     flexDirection: 'row',
     justifyContent: 'space-between',
     marginBottom: 18,
   },
   kicker: {
-    color: '#119C83',
+    color: '#3E58BD',
     fontSize: 13,
-    fontWeight: '800',
+    fontWeight: '900',
     letterSpacing: 0,
     marginBottom: 4,
   },
   title: {
-    color: '#111827',
-    fontSize: 28,
+    color: '#0F1730',
+    fontSize: 30,
     fontWeight: '900',
     letterSpacing: 0,
   },
   scorePill: {
     alignItems: 'center',
-    backgroundColor: '#111827',
-    borderRadius: 8,
+    backgroundColor: '#FFFFFF',
+    borderColor: '#D1DFFF',
+    borderRadius: 10,
+    borderWidth: 1,
     flexDirection: 'row',
     gap: 6,
-    paddingHorizontal: 11,
-    paddingVertical: 9,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
   },
   scoreIcon: {
-    color: '#69D2C8',
-    fontSize: 15,
+    color: '#3E58BD',
+    fontSize: 12,
     fontWeight: '900',
   },
   scoreText: {
-    color: '#FFFFFF',
+    color: '#1A2140',
     fontSize: 13,
     fontWeight: '900',
   },
   hero: {
-    backgroundColor: '#E9F8F6',
-    borderRadius: 8,
-    minHeight: 602,
+    backgroundColor: '#E9EEFF',
+    borderColor: '#D5E3FF',
+    borderRadius: 22,
+    borderWidth: 1,
+    minHeight: 590,
+    position: 'relative',
     overflow: 'hidden',
   },
+  heroGlow: {
+    backgroundColor: '#D9E5FF',
+    borderRadius: 140,
+    height: 280,
+    left: -70,
+    opacity: 0.72,
+    position: 'absolute',
+    top: -56,
+    width: 280,
+  },
+  heroGlowSoft: {
+    backgroundColor: '#B8CCFF',
+    borderRadius: 160,
+    bottom: 6,
+    height: 320,
+    opacity: 0.26,
+    position: 'absolute',
+    right: -96,
+    width: 260,
+  },
+  heroRibbon: {
+    backgroundColor: 'rgba(255,255,255,0.9)',
+    borderRadius: 999,
+    height: 10,
+    marginBottom: -6,
+    opacity: 0.65,
+    position: 'absolute',
+    width: '100%',
+    zIndex: 2,
+  },
   heroCopy: {
+    backgroundColor: 'rgba(255,255,255,0.84)',
+    borderTopLeftRadius: 22,
+    borderTopRightRadius: 22,
     justifyContent: 'space-between',
-    paddingBottom: 18,
+    paddingBottom: 20,
     paddingHorizontal: 18,
-    paddingTop: 10,
+    paddingTop: 16,
+    marginTop: -1,
+    zIndex: 3,
+  },
+  heroLabelWrap: {
+    alignItems: 'flex-start',
+    backgroundColor: 'rgba(91,101,214,0.12)',
+    borderRadius: 999,
+    marginBottom: 8,
+    paddingHorizontal: 9,
+    paddingVertical: 6,
   },
   heroLabel: {
-    color: '#F45D48',
+    color: '#3E58BD',
     fontSize: 12,
     fontWeight: '900',
     letterSpacing: 0,
-    marginBottom: 8,
     textTransform: 'uppercase',
   },
   heroTitle: {
-    color: '#111827',
-    fontSize: 22,
+    color: '#121A32',
+    fontSize: 27,
     fontWeight: '900',
     letterSpacing: 0,
-    lineHeight: 29,
+    lineHeight: 33,
+    marginBottom: 12,
   },
   metaRow: {
     flexDirection: 'row',
-    gap: 8,
+    gap: 10,
     marginTop: 18,
   },
   metaItem: {
-    backgroundColor: '#F7F8F3',
-    borderRadius: 8,
-    minWidth: 72,
-    paddingHorizontal: 10,
-    paddingVertical: 9,
+    backgroundColor: '#FFFFFF',
+    borderColor: '#DDE8FF',
+    borderRadius: 12,
+    borderWidth: 1,
+    minWidth: 80,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
   },
   metaValue: {
     color: '#111827',
@@ -654,21 +1150,21 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   metaLabel: {
-    color: '#72766D',
+    color: '#667186',
     fontSize: 11,
     fontWeight: '700',
     marginTop: 3,
   },
   photoPanel: {
     flexDirection: 'row',
-    gap: 8,
+    gap: 10,
     marginTop: 14,
   },
   photoCard: {
     alignItems: 'center',
     backgroundColor: '#FFFFFF',
-    borderColor: '#DDE3D7',
-    borderRadius: 8,
+    borderColor: '#D3E1FF',
+    borderRadius: 12,
     borderWidth: 1,
     flex: 1,
     flexDirection: 'row',
@@ -678,7 +1174,7 @@ const styles = StyleSheet.create({
   photoPreview: {
     alignItems: 'center',
     backgroundColor: '#EEF1EA',
-    borderRadius: 7,
+    borderRadius: 9,
     height: 46,
     justifyContent: 'center',
     overflow: 'hidden',
@@ -689,7 +1185,7 @@ const styles = StyleSheet.create({
     width: '100%',
   },
   photoAdd: {
-    color: '#119C83',
+    color: '#3E58BD',
     fontSize: 26,
     fontWeight: '900',
     lineHeight: 30,
@@ -711,7 +1207,7 @@ const styles = StyleSheet.create({
   },
   photoClear: {
     alignItems: 'center',
-    backgroundColor: '#111827',
+    backgroundColor: '#5B65D6',
     borderRadius: 999,
     height: 28,
     justifyContent: 'center',
@@ -768,22 +1264,22 @@ const styles = StyleSheet.create({
     width: 18,
   },
   segment: {
-    backgroundColor: '#ECEFE7',
-    borderRadius: 8,
+    backgroundColor: '#DBE6FF',
+    borderRadius: 14,
     flexDirection: 'row',
     marginTop: 16,
-    padding: 4,
+    padding: 5,
   },
   segmentButton: {
     alignItems: 'center',
-    borderRadius: 7,
+    borderRadius: 10,
     flex: 1,
     minHeight: 38,
     justifyContent: 'center',
     paddingHorizontal: 5,
   },
   segmentButtonActive: {
-    backgroundColor: '#111827',
+    backgroundColor: '#5B65D6',
   },
   segmentText: {
     color: '#60665D',
@@ -802,7 +1298,7 @@ const styles = StyleSheet.create({
     marginTop: 24,
   },
   sectionTitle: {
-    color: '#111827',
+    color: '#0F1730',
     fontSize: 19,
     fontWeight: '900',
     letterSpacing: 0,
@@ -819,14 +1315,14 @@ const styles = StyleSheet.create({
   },
   inputCell: {
     backgroundColor: '#FFFFFF',
-    borderColor: '#E7E9DF',
-    borderRadius: 8,
+    borderColor: '#D8E3FF',
+    borderRadius: 12,
     borderWidth: 1,
     padding: 12,
     width: '48.5%',
   },
   inputCellActive: {
-    borderColor: '#119C83',
+    borderColor: '#3E58BD',
     borderWidth: 2,
     padding: 11,
   },
@@ -837,7 +1333,7 @@ const styles = StyleSheet.create({
     marginBottom: 6,
   },
   inputLabel: {
-    color: '#72766D',
+    color: '#5F6888',
     fontSize: 12,
     fontWeight: '800',
   },
@@ -862,41 +1358,43 @@ const styles = StyleSheet.create({
   input: {
     color: '#111827',
     flex: 1,
-    fontSize: 22,
+    fontSize: 21,
     fontWeight: '900',
     padding: 0,
   },
   unit: {
-    color: '#119C83',
+    color: '#3E58BD',
     fontSize: 12,
     fontWeight: '900',
   },
   guidePanel: {
-    backgroundColor: '#FFFFFF',
-    borderColor: '#DDE3D7',
-    borderRadius: 8,
-    borderWidth: 1,
+    backgroundColor: '#17254C',
+    borderRadius: 14,
     marginTop: 10,
+    paddingHorizontal: 12,
     padding: 14,
   },
   guideHeader: {
     alignItems: 'center',
     flexDirection: 'row',
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    borderRadius: 10,
+    padding: 9,
     justifyContent: 'space-between',
     marginBottom: 7,
   },
   guideTitle: {
-    color: '#111827',
+    color: '#FFFFFF',
     fontSize: 15,
     fontWeight: '900',
   },
   guideTag: {
-    color: '#119C83',
+    color: '#FFD166',
     fontSize: 11,
     fontWeight: '900',
   },
   guideText: {
-    color: '#60665D',
+    color: '#D8DEF3',
     fontSize: 13,
     fontWeight: '700',
     lineHeight: 19,
@@ -907,20 +1405,20 @@ const styles = StyleSheet.create({
   },
   preferenceButton: {
     alignItems: 'center',
-    backgroundColor: '#FFFFFF',
-    borderColor: '#E7E9DF',
-    borderRadius: 8,
+    backgroundColor: '#F8FAFF',
+    borderColor: '#D7E2FF',
+    borderRadius: 10,
     borderWidth: 1,
     flex: 1,
     minHeight: 44,
     justifyContent: 'center',
   },
   preferenceButtonActive: {
-    backgroundColor: '#119C83',
-    borderColor: '#119C83',
+    backgroundColor: '#5B65D6',
+    borderColor: '#5B65D6',
   },
   preferenceText: {
-    color: '#60665D',
+    color: '#637195',
     fontSize: 13,
     fontWeight: '900',
   },
@@ -932,24 +1430,25 @@ const styles = StyleSheet.create({
     paddingRight: 18,
   },
   productCard: {
-    backgroundColor: '#FFFFFF',
-    borderColor: '#E7E9DF',
-    borderRadius: 8,
+    backgroundColor: '#F8FAFF',
+    borderColor: '#D5E1FF',
+    borderRadius: 12,
     borderWidth: 1,
     padding: 10,
     width: 156,
   },
   productCardActive: {
-    borderColor: '#111827',
+    borderColor: '#3E58BD',
     borderWidth: 2,
     padding: 9,
   },
   productVisual: {
     alignItems: 'center',
-    borderRadius: 7,
+    borderRadius: 10,
     height: 118,
     justifyContent: 'center',
     marginBottom: 10,
+    backgroundColor: '#FFFFFF',
   },
   hanger: {
     borderRadius: 999,
@@ -963,7 +1462,7 @@ const styles = StyleSheet.create({
     width: 82,
   },
   brand: {
-    color: '#119C83',
+    color: '#3E58BD',
     fontSize: 12,
     fontWeight: '900',
     marginBottom: 3,
@@ -982,8 +1481,8 @@ const styles = StyleSheet.create({
     marginTop: 6,
   },
   fitPanel: {
-    backgroundColor: '#111827',
-    borderRadius: 8,
+    backgroundColor: '#16254D',
+    borderRadius: 16,
     marginTop: 22,
     padding: 16,
   },
@@ -994,7 +1493,7 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   fitLabel: {
-    color: '#69D2C8',
+    color: '#A5B2FF',
     fontSize: 12,
     fontWeight: '900',
     letterSpacing: 0,
@@ -1012,13 +1511,13 @@ const styles = StyleSheet.create({
   recommendBadge: {
     alignItems: 'center',
     backgroundColor: '#FFFFFF',
-    borderRadius: 8,
+    borderRadius: 10,
     minWidth: 66,
     paddingHorizontal: 10,
     paddingVertical: 8,
   },
   recommendLabel: {
-    color: '#72766D',
+    color: '#6A7393',
     fontSize: 11,
     fontWeight: '800',
   },
@@ -1029,7 +1528,7 @@ const styles = StyleSheet.create({
     lineHeight: 28,
   },
   confidenceTrack: {
-    backgroundColor: '#2E3747',
+    backgroundColor: '#2E3B63',
     borderRadius: 999,
     height: 10,
     marginTop: 20,
@@ -1097,8 +1596,9 @@ const styles = StyleSheet.create({
   },
   secondaryButton: {
     alignItems: 'center',
-    borderColor: '#465265',
-    borderRadius: 8,
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    borderColor: '#6E79A7',
+    borderRadius: 10,
     borderWidth: 1,
     justifyContent: 'center',
     minHeight: 48,
@@ -1111,14 +1611,14 @@ const styles = StyleSheet.create({
   },
   primaryButton: {
     alignItems: 'center',
-    backgroundColor: '#69D2C8',
-    borderRadius: 8,
+    backgroundColor: '#6A7AF8',
+    borderRadius: 10,
     flex: 1,
     justifyContent: 'center',
     minHeight: 48,
   },
   primaryButtonText: {
-    color: '#111827',
+    color: '#FFFFFF',
     fontSize: 15,
     fontWeight: '900',
   },
