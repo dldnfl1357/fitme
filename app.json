@@ -32,7 +32,7 @@
       ]
     ],
     "experiments": {
-      "baseUrl": "/fitme"
+      "baseUrl": "/fitme/"
     }
   }
 }
